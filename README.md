@@ -1,5 +1,7 @@
 # wait-for-turn
 
+![wait-for-turn: Wait in line. Run one at a time.](.github/banner.png)
+
 GitHub Action that queues the runs of a workflow so only one run at a time uses shared resources (test stacks, environments), without cancelling pending runs the way a `concurrency` group does. Runs are ordered by the labels of their pull requests, so for example your own pull requests are tested before dependency updates, and release pull requests last.
 
 ## How it works
@@ -11,6 +13,32 @@ Waiting runs are ordered by weight (highest first), then by start time. A re-run
 The run that is next in line checks every `poll-interval-seconds`, the other waiting runs every `queued-poll-interval-seconds`. This keeps the API requests low when many runs are waiting. Labels are read while waiting, so labelling a pull request moves its waiting run in the queue.
 
 Active runs are read from the unfiltered run list. The `status` filter of the GitHub API is backed by a search index that can be stale and miss active runs (see [softprops/turnstyle#165](https://github.com/softprops/turnstyle/issues/165)).
+
+Each waiting run repeats these steps until it has the turn:
+
+```mermaid
+flowchart TD
+    start([Run starts]) --> poll[List active runs and lock refs]
+    poll --> own{Newest lock ref created by this run?}
+    own -- "yes (re-run)" --> done([Has the turn, next jobs run])
+    own -- no --> active{Holder run still active?}
+    active -- yes --> held[Turn held]
+    active -- no --> merge{"Holder succeeded and its PR has auto-merge enabled?"}
+    merge -- "yes, up to merge-wait-minutes" --> held
+    merge -- no --> free[Turn free]
+    held --> uptodate{"Branch up to date? (require-up-to-date)"}
+    free --> uptodate
+    uptodate -- no --> outdated([Fail: branch is behind])
+    uptodate -- yes --> queue[Order waiting runs by label weight, then start time]
+    queue --> first{Turn free and this run first?}
+    first -- yes --> take[Create lock ref n+1]
+    take -- created --> done
+    take -- "already exists" --> poll
+    first -- no --> timeout{timeout-minutes reached?}
+    timeout -- yes --> timedout([Fail: timed out])
+    timeout -- no --> sleep["Sleep poll-interval-seconds if first in line, else queued-poll-interval-seconds"]
+    sleep --> poll
+```
 
 ## Usage
 
