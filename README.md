@@ -1,5 +1,7 @@
 # wait-for-turn
 
+![wait-for-turn: Wait in line. Run one at a time.](.github/banner.png)
+
 GitHub Action that queues the runs of a workflow so only one run at a time uses shared resources (test stacks, environments), without cancelling pending runs the way a `concurrency` group does. Runs are ordered by the labels of their pull requests, so for example your own pull requests are tested before dependency updates, and release pull requests last.
 
 ## How it works
@@ -11,6 +13,32 @@ Waiting runs are ordered by weight (highest first), then by start time. A re-run
 The run that is next in line checks every `poll-interval-seconds`, the other waiting runs every `queued-poll-interval-seconds`. This keeps the API requests low when many runs are waiting. Labels are read while waiting, so labelling a pull request moves its waiting run in the queue.
 
 Active runs are read from the unfiltered run list. The `status` filter of the GitHub API is backed by a search index that can be stale and miss active runs (see [softprops/turnstyle#165](https://github.com/softprops/turnstyle/issues/165)).
+
+Each waiting run repeats these steps until it has the turn:
+
+```mermaid
+flowchart TD
+    start([Run starts]) --> poll[List active runs and lock refs]
+    poll --> own{Newest lock ref created by this run?}
+    own -- "yes (re-run)" --> done([Has the turn, next jobs run])
+    own -- no --> active{Holder run still active?}
+    active -- yes --> held[Turn held]
+    active -- no --> merge{"Holder succeeded and its PR has auto-merge enabled?"}
+    merge -- "yes, up to merge-wait-minutes" --> held
+    merge -- no --> free[Turn free]
+    held --> uptodate{"Branch up to date? (require-up-to-date)"}
+    free --> uptodate
+    uptodate -- no --> outdated([Fail: branch is behind])
+    uptodate -- yes --> queue[Order waiting runs by label weight, then start time]
+    queue --> first{Turn free and this run first?}
+    first -- yes --> take[Create lock ref n+1]
+    take -- created --> done
+    take -- "already exists" --> poll
+    first -- no --> timeout{timeout-minutes reached?}
+    timeout -- yes --> timedout([Fail: timed out])
+    timeout -- no --> sleep["Sleep poll-interval-seconds if first in line, else queued-poll-interval-seconds"]
+    sleep --> poll
+```
 
 ## Usage
 
@@ -62,7 +90,7 @@ The run holding the turn is never interrupted: a higher weight only affects whic
 
 With branch protection requiring branches to be up to date, testing a branch that is behind its base branch is wasted time: it has to be updated and tested again. With `require-up-to-date: true`, the action fails as soon as the branch is behind, while waiting and right before taking the turn. An outdated run stops right away and makes room for the run of the updated branch.
 
-A successful run often gets its pull request merged by auto-merge, a few seconds after the run completes. A run taking the turn in between would pass the check and then test a branch that is outdated right after the merge. So when the run holding the turn succeeded and its pull request has auto-merge enabled, the turn stays held until the pull request is merged or closed, auto-merge is disabled, or the branch turns out to be behind or conflicting. After the merge, the waiting runs fail as outdated. The wait ends after `merge-wait-minutes`, for example when another required check fails and auto-merge never merges. Pull requests you merge by hand can't be predicted: a run can still take the turn right before such a merge.
+A successful run often gets its pull request merged by auto-merge, a few seconds after the run completes. A run taking the turn in between would pass the check and then test a branch that is outdated right after the merge. So when the run holding the turn succeeded and its pull request has auto-merge enabled, the turn stays held until the pull request is merged or closed, auto-merge is disabled, the branch turns out to be behind or conflicting, or a new commit was pushed to it. A new commit is merged only after its own run, which may be waiting for this turn. After the merge, the waiting runs fail as outdated. The wait ends after `merge-wait-minutes`, for example when another required check fails and auto-merge never merges. Pull requests you merge by hand can't be predicted: a run can still take the turn right before such a merge.
 
 After a merge, the other pull requests are updated at different times. A release pull request, for example, is updated right away, while Renovate updates its branches a few minutes later. The run of the release pull request would be the only waiting run and take the turn, although it has the lowest weight. So before taking the turn, a run lets open pull requests with auto-merge enabled and a higher weight go first while they are about to be tested: their branch is behind the base branch and about to be updated, or their head commit has no run of the workflow yet. Pull requests whose head commit was already tested, successfully or not, don't hold up the queue. The wait ends after `yield-to-pending-minutes`, for example when a branch is never updated.
 
