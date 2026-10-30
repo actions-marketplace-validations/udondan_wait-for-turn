@@ -7,8 +7,11 @@
 # already exists, so only one run can take the turn.
 #
 # Waiting runs are ordered by the summed weight of their pull request labels
-# (highest first), then by start time. Only the first waiting run takes the
-# turn. It checks often, the others check less often to save API requests.
+# (highest first), then by start time. Runs without a pull request, for example
+# of a push to main, have the weight no-pull-request-weight. A run of a pull request that has a newer
+# run is left out. Only the first waiting run takes the turn. It checks often,
+# the others check less often to save API requests, except while the turn is
+# free: the first run may never take it.
 #
 # When the holder succeeded and its pull request has auto-merge enabled, the
 # pull request is merged a few seconds after the run completes. A run taking the
@@ -41,6 +44,11 @@ timeout_minutes="${INPUT_TIMEOUT_MINUTES:-0}"
 require_up_to_date="${INPUT_REQUIRE_UP_TO_DATE:-false}"
 merge_wait="${INPUT_MERGE_WAIT:-10}"
 yield_minutes="${INPUT_YIELD_MINUTES:-10}"
+no_pr_weight="${INPUT_NO_PR_WEIGHT:-0}"
+if ! [[ "$no_pr_weight" =~ ^-?(0|[1-9][0-9]*)$ ]]; then
+  echo "::error::Invalid no-pull-request-weight: $no_pr_weight. Expected an integer."
+  exit 1
+fi
 repo="repos/$GITHUB_REPOSITORY"
 lock_prefix="wait-for-turn/$workflow"
 
@@ -71,9 +79,29 @@ check_up_to_date() {
     return 0
   fi
   if [ "$behind" -gt 0 ]; then
+    update_branch "$behind"
     echo "::error::Branch is $behind commit(s) behind $BASE_REF. Update the branch to run the tests."
     exit 1
   fi
+}
+
+# Rebases the pull request branch onto the base branch with update-token, then
+# fails the run: its commit is outdated, the new commit starts a new run.
+# Returns without doing anything when no update-token is set or the branch is
+# in a fork.
+update_branch() {
+  local behind=$1 output
+  [ -n "${UPDATE_TOKEN:-}" ] || return 0
+  if [ "${HEAD_REPO:-}" != "$GITHUB_REPOSITORY" ]; then
+    echo "::notice::The branch is in another repository and can't be updated."
+    return 0
+  fi
+  if ! output=$(GH_TOKEN="$UPDATE_TOKEN" gh pr update-branch "$PR_NUMBER" --rebase -R "$GITHUB_REPOSITORY" 2>&1); then
+    echo "::error::Branch is $behind commit(s) behind $BASE_REF and rebasing it failed: $output"
+    exit 1
+  fi
+  echo "::notice::Branch was $behind commit(s) behind $BASE_REF and was rebased. The new commit starts a new run."
+  exit 1
 }
 
 # Prints "<n> <commit sha>" of all lock refs, sorted by n.
@@ -311,9 +339,18 @@ while true; do
       next_refresh=$((SECONDS + queued_interval))
     fi
 
-    queue=$(jq -n --argjson runs "$active" --argjson prs "$prs" --argjson w "$weights" --arg holder "$holder" '
+    # A run of a pull request that has a newer run is left out: its commit is
+    # outdated, and it may still be active although it will never take the
+    # turn, for example while other jobs finish after it failed as outdated.
+    # This run always stays in the queue.
+    queue=$(jq -n --argjson runs "$active" --argjson prs "$prs" --argjson w "$weights" --arg holder "$holder" \
+      --argjson self "$GITHUB_RUN_ID" --argjson nopr "$no_pr_weight" '
       ($prs | map({key: (.number | tostring), value: ([.labels[] | $w[.] // 0] | add // 0)}) | from_entries) as $pw
-      | $runs | map(select((.id | tostring) != $holder) | . + {weight: ($pw[.pr | tostring] // 0)})
+      | ($runs | map(select(.pr != null)) | group_by(.pr)
+        | map({key: (.[0].pr | tostring), value: (map(.id) | max)}) | from_entries) as $newest
+      | $runs | map(select((.id | tostring) != $holder)
+        | select(.id == $self or .pr == null or $newest[.pr | tostring] == .id)
+        | . + {weight: (if .pr == null then $nopr else ($pw[.pr | tostring] // 0) end)})
       | sort_by(-.weight, .run_started_at, .id)')
     position=$(echo "$queue" | jq --argjson id "$GITHUB_RUN_ID" 'map(.id) | index($id) // -1')
 
@@ -333,7 +370,9 @@ while true; do
       continue
     fi
 
-    if [ "$position" = "0" ]; then
+    # The first run checks often. While the turn is free, so do all others: the
+    # first run may never take it, for example when it fails as outdated.
+    if [ "$position" = "0" ] || [ "$free" = "true" ]; then
       sleep_for=$interval
     fi
     if [ "$position" = "-1" ]; then
