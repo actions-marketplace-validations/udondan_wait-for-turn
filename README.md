@@ -1,14 +1,20 @@
 # wait-for-turn
 
-![wait-for-turn: Wait in line. Run one at a time.](.github/banner.png)
+![wait-for-turn: Wait in line. Run one at a time.](.github/banner.webp)
 
-GitHub Action that queues the runs of a workflow so only one run at a time uses shared resources (test stacks, environments), without cancelling pending runs the way a `concurrency` group does. Runs are ordered by the labels of their pull requests, so for example your own pull requests are tested before dependency updates, and release pull requests last.
+[![Release](https://img.shields.io/github/v/release/udondan/wait-for-turn)](https://github.com/udondan/wait-for-turn/releases/latest)
+[![Marketplace](https://img.shields.io/badge/marketplace-wait--for--turn-blue?logo=github)](https://github.com/marketplace/actions/wait-for-turn)
+[![Test](https://github.com/udondan/wait-for-turn/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/udondan/wait-for-turn/actions/workflows/test.yml?query=branch%3Amain)
+[![Coverage](https://codecov.io/gh/udondan/wait-for-turn/graph/badge.svg)](https://codecov.io/gh/udondan/wait-for-turn)
+[![License](https://img.shields.io/github/license/udondan/wait-for-turn)](LICENSE)
+
+GitHub Action that queues the runs of a workflow so only one run at a time uses shared resources (test stacks, environments), without cancelling pending runs the way a `concurrency` group does. Runs are ordered by the labels of their pull requests, so for example your own pull requests are tested before dependency updates, and release pull requests last. See [Alternatives](#alternatives) for when merge queue fits better.
 
 ## How it works
 
 The run that has the turn holds the lock ref `refs/wait-for-turn/<workflow>/<n>`. The turn is released when that run completes, including all jobs after the wait, or, if its pull request is about to be auto-merged, after the merge (see [Outdated branches](#outdated-branches)). The next run takes the turn by creating ref `<n+1>`. Creating a ref fails if it already exists, so only one run can take the turn. Old lock refs are deleted.
 
-Waiting runs are ordered by weight (highest first), then by start time. A re-run of the run holding the turn keeps it. A re-run of any other run queues by its new start time. A run of a pull request that has a newer run is left out of the queue: its commit is outdated, and it can stay active for a while after it stopped waiting, for example while other jobs finish after it failed as outdated.
+Waiting runs are ordered by weight (highest first), then by start time. A re-run of the run holding the turn keeps it. A re-run of any other run queues by its new start time. A run of a pull request that has a newer run is left out of the queue: its commit is outdated, and it can stay active for a while after it stopped waiting, for example while other jobs finish after it failed as outdated. A waiting run fails as soon as its pull request has a newer run of another commit, so it never tests the outdated commit. To stop it right away instead of at its next check, add a `concurrency` group (see [Workflow setup](#workflow-setup)).
 
 The run that is next in line checks every `poll-interval-seconds`, the other waiting runs every `queued-poll-interval-seconds`. This keeps the API requests low when many runs are waiting. While the turn is free, all waiting runs check every `poll-interval-seconds`, so the next run takes the turn quickly when the first one never does. Labels are read while waiting, so labelling a pull request moves its waiting run in the queue.
 
@@ -21,7 +27,9 @@ flowchart TD
     start([Run starts]) --> poll[List active runs and lock refs]
     poll --> own{Newest lock ref created by this run?}
     own -- "yes (re-run)" --> done([Has the turn, next jobs run])
-    own -- no --> active{Holder run still active?}
+    own -- no --> newer{"PR has a newer run of another commit?"}
+    newer -- yes --> stale([Fail: commit is outdated])
+    newer -- no --> active{Holder run still active?}
     active -- yes --> held[Turn held]
     active -- no --> merge{"Holder succeeded and its PR has auto-merge enabled?"}
     merge -- "yes, up to merge-wait-minutes" --> held
@@ -51,6 +59,9 @@ jobs:
       actions: read
       contents: write
       pull-requests: read
+    concurrency:
+      group: ${{ github.workflow }}-wait-${{ github.head_ref || github.ref }}
+      cancel-in-progress: true
     steps:
       - uses: udondan/wait-for-turn@v1
         with:
@@ -61,10 +72,16 @@ jobs:
 
   deploy:
     needs: wait-for-turn
-    # ...
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check turn
+        if: needs.wait-for-turn.result != 'success'
+        run: exit 1
+      # ...
 ```
 
-All runs of the workflow must use this action, otherwise they don't take part in the queue.
+All runs of the workflow must use this action, otherwise they don't take part in the queue. The `concurrency` group and the `Check turn` step are explained in [Workflow setup](#workflow-setup).
 
 ## Inputs
 
@@ -80,7 +97,26 @@ All runs of the workflow must use this action, otherwise they don't take part in
 | `merge-wait-minutes`           | `10`                        | Keep the turn held while the holder's PR is auto-merged (see below).        |
 | `yield-to-pending-minutes`     | `10`                        | Let pending auto-merge PRs with a higher weight go first (see below).       |
 | `update-token`                 |                             | Token to rebase a PR branch that is behind (see below).                     |
+| `status-context`               |                             | Context of a commit status showing the place in the queue (see below).      |
 | `token`                        | `github.token`              | Token with `actions: read`, `contents: write` and `pull-requests: read`.    |
+
+## Workflow setup
+
+**Cancel outdated waiting runs.** A new commit on a branch makes the waiting run of the previous commit outdated. The action fails it at its next check, but until then it takes a runner. A `concurrency` group per branch with `cancel-in-progress` cancels it right away. Put the group on the wait job only, not on the workflow or the jobs after it: once a run has the turn, the wait job is done, so jobs that already use the shared resources are never cancelled and can always clean up.
+
+**Fail the jobs after the wait when the wait fails.** When the wait fails, for example as outdated or on timeout, jobs that need it are skipped, and a skipped job counts as passed for required checks. Run them with `if: ${{ !cancelled() }}` and fail them in a first step when the wait didn't succeed, as in the example above. Or require a single job that checks all others:
+
+```yaml
+  required:
+    needs: [wait-for-turn, deploy]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: exit 1
+```
+
+**Let other jobs wait as well.** Jobs that don't use the shared resources, like a build, can run without waiting. But then the runs of all open pull requests run them at once, and many are tested again after a rebase anyway. With few runners, let them wait for the turn as well.
 
 ## Priorities
 
@@ -125,6 +161,43 @@ A successful run often gets its pull request merged by auto-merge, a few seconds
 
 After a merge, the other pull requests are updated at different times. A release pull request, for example, is updated right away, while Renovate updates its branches a few minutes later. The run of the release pull request would be the only waiting run and take the turn, although it has the lowest weight. So before taking the turn, a run lets open pull requests with auto-merge enabled and a higher weight go first while they are about to be tested: their branch is behind the base branch and about to be updated, or their head commit has no run of the workflow yet. Pull requests whose head commit was already tested, successfully or not, don't hold up the queue. The wait ends after `yield-to-pending-minutes`, for example when a branch is never updated.
 
+## Queue status
+
+The log shows the queue, but GitHub doesn't show the log of a composite action live, only after the step completed. With `status-context`, the action sets a commit status with that context on the head commit, visible live in the pull request's checks. It links to the run.
+
+- pending while waiting, e.g. `Position 2 of 4 (weight -5). Turn held by #123.`
+- success once the run took the turn
+- failure when waiting failed, e.g. on timeout or an outdated branch, and error when the run was cancelled
+
+The token needs `statuses: write`. Without it, the action logs a warning and waits without the status. A run killed before it can clean up leaves the status pending.
+
+```yaml
+    permissions:
+      actions: read
+      contents: write
+      pull-requests: read
+      statuses: write
+    steps:
+      - uses: udondan/wait-for-turn@v1
+        with:
+          status-context: wait-for-turn
+```
+
+## Alternatives
+
+- **`concurrency` groups** run one run at a time, but keep only one pending run. A newer pending run cancels the older one, so pull requests that wait at the same time are not all tested. There is no order by priority.
+- **[Merge queue](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/configuring-pull-request-merges/managing-a-merge-queue)** solves outdated branches at the source: it tests each pull request together with the ones ahead of it and merges it itself, so nothing has to be rebased or waited for after a merge. Combined with a `concurrency` group on the `merge_group` workflow, it also tests one pull request at a time. It is only available for repositories owned by organizations and orders pull requests by the time they were added (or moved to the front by hand), not by labels. If you can use it, prefer it over `require-up-to-date`, `merge-wait-minutes` and `yield-to-pending-minutes`.
+- **Other queue actions**, like [softprops/turnstyle](https://github.com/softprops/turnstyle) or [ben-z/gh-action-mutex](https://github.com/ben-z/gh-action-mutex), run one run at a time, first come, first served.
+
+This action is for repositories without merge queue, for example ones owned by a user, where runs share resources and some pull requests should go first. It adds the order by labels and the handling of outdated branches and auto-merge.
+
 ## Limitations
 
-Pull requests from forks and from Dependabot get a read-only token and can't create the lock ref. The action then fails with a permission error.
+Pull requests from forks and from Dependabot get a read-only token and can't create the lock ref. The action then fails with a permission error. Skip the wait job for them instead:
+
+```yaml
+  wait-for-turn:
+    if: github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]')
+```
+
+Jobs after it then have to treat a skipped wait as success, for example with `if: needs.wait-for-turn.result == 'failure' || needs.wait-for-turn.result == 'cancelled'` in the `Check turn` step. They don't get the secrets either, so skip the jobs that use the shared resources for them as well.

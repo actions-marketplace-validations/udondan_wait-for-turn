@@ -9,9 +9,10 @@
 # Waiting runs are ordered by the summed weight of their pull request labels
 # (highest first), then by start time. Runs without a pull request, for example
 # of a push to main, have the weight no-pull-request-weight. A run of a pull request that has a newer
-# run is left out. Only the first waiting run takes the turn. It checks often,
-# the others check less often to save API requests, except while the turn is
-# free: the first run may never take it.
+# run is left out, and fails if the newer run is of another commit. Only the
+# first waiting run takes the turn. It checks often, the others check less often
+# to save API requests, except while the turn is free: the first run may never
+# take it.
 #
 # When the holder succeeded and its pull request has auto-merge enabled, the
 # pull request is merged a few seconds after the run completes. A run taking the
@@ -64,6 +65,39 @@ weights=$(printf '%s\n' "${INPUT_LABEL_WEIGHTS:-}" | jq -R -s '
         // error("Invalid label-weights line: \(.). Expected label=weight."))
   | map({(.label): (.weight | tonumber)}) | add // {}')
 
+# Commit status that shows the place in the queue, visible live in the pull
+# request's checks. The log of a composite action is not shown live. Set on the
+# pull request's head commit, not the merge commit.
+status_context="${INPUT_STATUS_CONTEXT:-}"
+status_sha="${HEAD_SHA:-$GITHUB_SHA}"
+status_url="${GITHUB_SERVER_URL:-https://github.com}/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+last_status=""
+status_final=false
+fail_state=failure
+fail_description="Waiting for the turn failed, see the log."
+# Sets the commit status if it changed. Descriptions are limited to 140
+# characters. A failing request stops further updates but not the waiting.
+set_status() {
+  local state=$1 description=${2:0:140} out fields
+  [ -n "$status_context" ] || return 0
+  [ "$state $description" != "$last_status" ] || return 0
+  fields=(-f state="$state" -f context="$status_context" -f description="$description" -f target_url="$status_url")
+  if ! out=$(gh api "$repo/statuses/$status_sha" "${fields[@]}" --silent 2>&1); then
+    echo "::warning::Setting commit status $status_context failed, no longer updating it. The token needs statuses: write permission. $out"
+    status_context=""
+    return 0
+  fi
+  last_status="$state $description"
+}
+on_exit() {
+  local code=$?
+  if [ "$code" -ne 0 ] && [ "$status_final" != "true" ]; then
+    set_status "$fail_state" "$fail_description"
+  fi
+}
+trap on_exit EXIT
+trap 'fail_state=error; fail_description="Cancelled while waiting for the turn."; exit 130' INT TERM
+
 # Fails the run if the branch is behind the base branch. Testing an outdated
 # branch is wasted time: it has to be updated and tested again anyway.
 # With "strict", a failing API request fails the run as well.
@@ -80,6 +114,7 @@ check_up_to_date() {
   fi
   if [ "$behind" -gt 0 ]; then
     update_branch "$behind"
+    fail_description="Branch is $behind commit(s) behind $BASE_REF."
     echo "::error::Branch is $behind commit(s) behind $BASE_REF. Update the branch to run the tests."
     exit 1
   fi
@@ -100,6 +135,7 @@ update_branch() {
     echo "::error::Branch is $behind commit(s) behind $BASE_REF and rebasing it failed: $output"
     exit 1
   fi
+  fail_description="Branch was behind $BASE_REF and was rebased. The new commit starts a new run."
   echo "::notice::Branch was $behind commit(s) behind $BASE_REF and was rebased. The new commit starts a new run."
   exit 1
 }
@@ -198,6 +234,13 @@ declare -A head_states=() head_checked=()
 # branch is behind and about to be updated, or their head commit has no run of
 # this workflow yet. Pull requests whose head commit was tested, successfully
 # or not, are not pending.
+# shellcheck disable=SC2016 # jq variables
+pending_query='
+  .[] | select(.auto_merge and (.number | tostring) != $self)
+  | select(.number as $n | all($runs[]; .pr != $n))
+  | select(([.labels[] | $w[.] // 0] | add // 0) > $weight)
+  | "\(.number) \(.sha) \(.base)"'
+pending_args=(--argjson w "$weights" --arg self "${PR_NUMBER:-}")
 find_pending() {
   local weight=$1 number sha base behind count
   pending=""
@@ -221,12 +264,7 @@ find_pending() {
     if [ "${head_states[$sha]:-}" != "tested" ]; then
       pending="$pending #$number"
     fi
-  done < <(echo "$prs" | jq -r --argjson w "$weights" --argjson weight "$weight" \
-    --argjson runs "$active" --arg self "${PR_NUMBER:-}" '
-    .[] | select(.auto_merge and (.number | tostring) != $self)
-    | select(.number as $n | all($runs[]; .pr != $n))
-    | select(([.labels[] | $w[.] // 0] | add // 0) > $weight)
-    | "\(.number) \(.sha) \(.base)"')
+  done < <(echo "$prs" | jq -r "${pending_args[@]}" --argjson weight "$weight" --argjson runs "$active" "$pending_query")
   pending=${pending# }
 }
 
@@ -288,7 +326,25 @@ take_turn() {
 
 runs_url="$repo/actions/workflows/$workflow/runs?per_page=100"
 runs_query='[.workflow_runs[] | select(.status != "completed")
-  | {id, run_started_at, html_url, pr: (.pull_requests[0].number // null)}]'
+  | {id, run_started_at, html_url, head_sha, pr: (.pull_requests[0].number // null)}]'
+prs_url="$repo/pulls?state=open&per_page=100"
+prs_query='.[] | {number, labels: [.labels[].name], auto_merge: (.auto_merge != null),
+  sha: .head.sha, base: .base.ref}'
+# A run of a pull request that has a newer run is left out: its commit is
+# outdated, and it may still be active although it will never take the turn,
+# for example while other jobs finish after it failed as outdated. This run
+# stays in the queue: check_newer_run fails it if the newer run is of another
+# commit, otherwise the newer run is a duplicate of the same commit.
+# shellcheck disable=SC2016 # jq variables
+queue_query='
+  ($prs | map({key: (.number | tostring), value: ([.labels[] | $w[.] // 0] | add // 0)}) | from_entries) as $pw
+  | ($runs | map(select(.pr != null)) | group_by(.pr)
+    | map({key: (.[0].pr | tostring), value: (map(.id) | max)}) | from_entries) as $newest
+  | $runs | map(select((.id | tostring) != $holder)
+    | select(.id == $self or .pr == null or $newest[.pr | tostring] == .id)
+    | . + {weight: (if .pr == null then $nopr else ($pw[.pr | tostring] // 0) end)})
+  | sort_by(-.weight, .run_started_at, .id)'
+queue_args=(--argjson w "$weights" --argjson self "$GITHUB_RUN_ID" --argjson nopr "$no_pr_weight")
 prs='[]'
 next_refresh=0
 last_state=""
@@ -297,6 +353,36 @@ deadline=0
 if [ "$timeout_minutes" -gt 0 ]; then
   deadline=$((SECONDS + timeout_minutes * 60))
 fi
+
+# Fails the run when its pull request has a newer run of another commit. Its
+# commit is outdated, and the other runs leave it out of their queue, so it
+# could take the turn and test the outdated commit.
+# shellcheck disable=SC2016 # jq variables
+newer_query='[.[] | select(.pr == $pr and .id > $self and .head_sha != $sha)]
+  | max_by(.id) | .html_url // empty'
+check_newer_run() {
+  local newer
+  if [ -z "${PR_NUMBER:-}" ] || [ -z "${HEAD_SHA:-}" ]; then
+    return 0
+  fi
+  newer=$(echo "$active" | jq -r --argjson pr "$PR_NUMBER" --argjson self "$GITHUB_RUN_ID" --arg sha "$HEAD_SHA" "$newer_query")
+  [ -n "$newer" ] || return 0
+  fail_description="Outdated, a newer commit of #$PR_NUMBER is tested."
+  echo "::error::A newer commit of pull request #$PR_NUMBER is tested in $newer. This commit is outdated."
+  exit 1
+}
+
+# Marks the commit status as successful once this run has the turn.
+took_turn() {
+  local description="Took the turn."
+  if [ "$SECONDS" -ge 60 ]; then
+    description="Took the turn after $((SECONDS / 60)) min."
+  fi
+  set_status success "$description"
+  status_final=true
+}
+
+set_status pending "Waiting for the turn."
 
 while true; do
   sleep_for=$queued_interval
@@ -314,24 +400,31 @@ while true; do
     if [ "$holder" = "$GITHUB_RUN_ID" ]; then
       # A re-run of the holder keeps the turn.
       echo "This run already has the turn."
+      took_turn
       break
     fi
+    check_newer_run
     free=true
     held="Turn held by run $holder."
+    # Short form of held for the commit status.
+    held_by="run $holder"
+    if [ -n "$holder_pr" ]; then
+      held_by="#$holder_pr"
+    fi
+    held_status="Turn held by $held_by."
     if [ -n "$holder" ]; then
       if is_active "$holder"; then
         free=false
       elif merge_pending "$holder" "$holder_pr"; then
         free=false
         held="Run $holder completed, waiting for its pull request #$holder_pr to be merged."
+        held_status="Waiting for #$holder_pr to be merged."
       fi
     fi
 
     if [ "$SECONDS" -ge "$next_refresh" ] || [ "$free" = "true" ]; then
       check_up_to_date
-      if new_prs=$(gh api --paginate "$repo/pulls?state=open&per_page=100" \
-          --jq '.[] | {number, labels: [.labels[].name], auto_merge: (.auto_merge != null),
-            sha: .head.sha, base: .base.ref}' | jq -s .); then
+      if new_prs=$(gh api --paginate "$prs_url" --jq "$prs_query" | jq -s .); then
         prs=$new_prs
       else
         echo "Listing pull requests failed, using the last known labels."
@@ -339,30 +432,20 @@ while true; do
       next_refresh=$((SECONDS + queued_interval))
     fi
 
-    # A run of a pull request that has a newer run is left out: its commit is
-    # outdated, and it may still be active although it will never take the
-    # turn, for example while other jobs finish after it failed as outdated.
-    # This run always stays in the queue.
-    queue=$(jq -n --argjson runs "$active" --argjson prs "$prs" --argjson w "$weights" --arg holder "$holder" \
-      --argjson self "$GITHUB_RUN_ID" --argjson nopr "$no_pr_weight" '
-      ($prs | map({key: (.number | tostring), value: ([.labels[] | $w[.] // 0] | add // 0)}) | from_entries) as $pw
-      | ($runs | map(select(.pr != null)) | group_by(.pr)
-        | map({key: (.[0].pr | tostring), value: (map(.id) | max)}) | from_entries) as $newest
-      | $runs | map(select((.id | tostring) != $holder)
-        | select(.id == $self or .pr == null or $newest[.pr | tostring] == .id)
-        | . + {weight: (if .pr == null then $nopr else ($pw[.pr | tostring] // 0) end)})
-      | sort_by(-.weight, .run_started_at, .id)')
+    queue=$(jq -n "${queue_args[@]}" --argjson runs "$active" --argjson prs "$prs" --arg holder "$holder" "$queue_query")
     position=$(echo "$queue" | jq --argjson id "$GITHUB_RUN_ID" 'map(.id) | index($id) // -1')
 
     if [ "$free" = "true" ] && [ "$position" = "0" ] && yielding "$(echo "$queue" | jq '.[0].weight')"; then
       free=false
       held="Letting pull requests with a higher weight go first, they are about to be tested: $pending."
+      held_status="Letting $pending go first."
     fi
 
     if [ "$free" = "true" ] && [ "$position" = "0" ]; then
       check_up_to_date strict
       if take_turn $((newest + 1)); then
         echo "Took the turn."
+        took_turn
         break
       fi
       echo "Could not take the turn, another run may have been faster. Retrying."
@@ -377,22 +460,29 @@ while true; do
     fi
     if [ "$position" = "-1" ]; then
       state="This run is not in the list of active runs yet."
+      status_description=$state
     else
       state=$(echo "$queue" | jq -r --argjson pos "$position" '
         "Position \($pos + 1) of \(length) (weight \(.[$pos].weight)). Queue: "
         + (map("\(.html_url) (weight \(.weight))") | join(", "))')
+      status_description=$(echo "$queue" | jq -r --argjson pos "$position" '
+        "Position \($pos + 1) of \(length) (weight \(.[$pos].weight))."')
       if [ "$free" = "true" ]; then
         state="$state. The turn is free, waiting for the first run to take it."
+        status_description="$status_description The turn is free."
       else
         state="$state. $held"
+        status_description="$status_description $held_status"
       fi
     fi
+    set_status pending "$status_description"
     if [ "$state" != "$last_state" ]; then
       echo "$state"
       last_state=$state
     fi
   fi
   if [ "$deadline" -gt 0 ] && [ "$SECONDS" -ge "$deadline" ]; then
+    fail_description="Timed out after $timeout_minutes minutes waiting for the turn."
     echo "::error::Timed out after $timeout_minutes minutes waiting for the turn."
     exit 1
   fi
