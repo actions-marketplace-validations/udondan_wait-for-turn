@@ -329,6 +329,46 @@ holder_succeeded() {
   [ "$(count_calls '^sleep')" -eq 0 ]
 }
 
+@test "doesn't wait for the merge when a required check of the pull request failed" {
+  holder_succeeded
+  set_pr 2 '.mergeable_state = "blocked"'
+  set_checks 2 '[{"name": "lint", "conclusion": "FAILURE", "isRequired": false},
+    {"name": "test", "conclusion": "FAILURE", "isRequired": true},
+    {"context": "ci/external", "state": "ERROR", "isRequired": true},
+    {"name": "build", "conclusion": "SUCCESS", "isRequired": true}]'
+  run_wait
+  assert_status 0
+  assert_output_contains "Required checks of #2 failed, it won't be merged: test, ci/external."
+  [ "$(count_calls '^sleep')" -eq 0 ]
+  assert_holds 2
+}
+
+@test "waits for the merge while required checks are pending or only other checks failed" {
+  holder_succeeded
+  set_pr 2 '.mergeable_state = "blocked"'
+  set_checks 2 '[{"name": "lint", "conclusion": "FAILURE", "isRequired": false},
+    {"name": "test", "conclusion": null, "isRequired": true},
+    {"context": "ci/external", "state": "PENDING", "isRequired": true}]'
+  at_tick 2 'set_pr 2 ".state = \"closed\""'
+  run_wait
+  assert_status 0
+  [ "$(count_calls '^POST graphql')" -eq 2 ]
+  [ "$(count_calls '^sleep')" -eq 2 ]
+  assert_holds 2
+}
+
+@test "waits for the merge when the checks of the pull request can't be read" {
+  holder_succeeded
+  set_pr 2 '.mergeable_state = "blocked"'
+  fail_api 403 '^POST graphql'
+  at_tick 2 'set_pr 2 ".state = \"closed\""'
+  run_wait
+  assert_status 0
+  [ "$(grep -c "::warning::Reading the checks of #2 failed" <<<"$output")" -eq 1 ]
+  [ "$(count_calls '^sleep')" -eq 2 ]
+  assert_holds 2
+}
+
 @test "stops waiting for the merge after merge-wait-minutes" {
   export INPUT_MERGE_WAIT=1
   holder_succeeded
@@ -675,6 +715,22 @@ EOF
   assert_output_contains "::warning::Setting commit status wait-for-turn failed"
   [ "$(count_calls '^POST statuses/')" -eq 1 ]
   assert_holds 1
+}
+
+@test "a signal while sleeping sets status error right away" {
+  holder_running
+  export INPUT_POLL_INTERVAL=60 FAKE_REAL_SLEEP=1
+  env BASH_ENV="$FAKE_LIB/fake-sleep.bash" bash "$BATS_TEST_DIRNAME/../wait.sh" >"$FAKE_STATE/out" 2>&1 3>&- &
+  local pid=$! started=$SECONDS
+  until [ -s "$FAKE_STATE/ticks/sleep_pid" ]; do command sleep 0.1; done
+  kill -TERM "$pid"
+  status=0
+  wait "$pid" || status=$?
+  output=$(cat "$FAKE_STATE/out")
+  kill "$(cat "$FAKE_STATE/ticks/sleep_pid")" 2>/dev/null || true
+  assert_status 130
+  [ $((SECONDS - started)) -lt 10 ] || { echo "took $((SECONDS - started))s"; return 1; }
+  assert_last_commit_status "error|Cancelled while waiting for the turn."
 }
 
 @test "no commit status without status-context" {
