@@ -136,6 +136,38 @@ holder_succeeded() {
   assert_holds 3
 }
 
+@test "fails at once when the token can't create the lock commit" {
+  fail_api 403 '^POST git/commits$'
+  fail_message "Resource not accessible by integration"
+  run_wait
+  assert_status 1
+  assert_output_contains "Creating the lock commit failed: gh: Resource not accessible by integration (HTTP 403)"
+  assert_output_contains "The token needs contents: write permission."
+  [ "$(count_calls '^sleep')" -eq 0 ]
+  assert_locks
+  assert_last_commit_status "failure|Waiting for the turn failed, see the log."
+}
+
+@test "retries when creating the lock commit fails for another reason" {
+  fail_api 502 '^POST git/commits$'
+  at_tick 1 'rm "$FAKE_STATE/fail"'
+  run_wait
+  assert_status 0
+  assert_output_contains "Creating the lock commit failed: gh: Fake failure (HTTP 502)"
+  assert_output_contains "Could not take the turn, another run may have been faster."
+  assert_holds 1
+}
+
+@test "retries when creating the lock commit hits a rate limit" {
+  fail_api 403 '^POST git/commits$'
+  fail_message "You have exceeded a secondary rate limit"
+  at_tick 1 'rm "$FAKE_STATE/fail"'
+  run_wait
+  assert_status 0
+  assert_output_contains "Creating the lock commit failed: gh: You have exceeded a secondary rate limit (HTTP 403)"
+  assert_holds 1
+}
+
 @test "fails when the lock ref can't be created" {
   fail_api 403 '^POST git/refs$'
   run_wait
@@ -612,8 +644,9 @@ holder_succeeded() {
 }
 
 @test "update-token doesn't touch branches of forks" {
-  export INPUT_REQUIRE_UP_TO_DATE=true UPDATE_TOKEN=update HEAD_REPO=someone/repo
-  set_behind head1 3
+  on_behalf_of_fork_run
+  export INPUT_REQUIRE_UP_TO_DATE=true UPDATE_TOKEN=update
+  set_behind head3 3
   run_wait
   assert_status 1
   assert_output_contains "::notice::The branch is in another repository and can't be updated."
@@ -738,4 +771,311 @@ EOF
   run_wait
   assert_status 0
   [ "$(count_calls '^POST statuses/')" -eq 0 ]
+}
+
+# --- Pull requests from forks ---
+
+# This run as a run of pull request 1 from a fork, with a read-only token.
+this_run_is_fork() {
+  export HEAD_REPO=someone/repo
+  set_run 100 '.pull_requests = [] | .head_repository.full_name = "someone/repo"'
+  set_pr 1 '.head.repo.full_name = "someone/repo"'
+}
+
+# Waits on behalf of run 300 of pull request 3 from a fork, like the
+# workflow_run workflow does, whose event has no pull request.
+on_behalf_of_fork_run() {
+  export INPUT_RUN_ID=300 GITHUB_RUN_ID=900 GITHUB_EVENT_NAME=workflow_run GITHUB_SHA=main1
+  export GITHUB_WORKFLOW_REF="owner/repo/.github/workflows/forks.yml@refs/heads/main"
+  export PR_NUMBER="" BASE_REF="" HEAD_SHA="" HEAD_REPO=""
+  add_pr 3
+  fork_run 300 3 00:05
+}
+
+@test "a run of a pull request from a fork gets the weight of its pull request" {
+  export INPUT_LABEL_WEIGHTS="prio=5"
+  add_pr 3 prio
+  fork_run 300 3 00:15
+  stop_at_tick 1
+  run_wait
+  assert_status 99
+  assert_output_contains "Position 2 of 2 (weight 0)"
+  assert_output_contains "runs/300 (weight 5)"
+  assert_locks ""
+}
+
+@test "a pull_request_target run of a pull request from a fork gets the weight of its pull request" {
+  export INPUT_LABEL_WEIGHTS="prio=5"
+  add_pr 3 prio
+  fork_run 300 3 00:15
+  set_run 300 '.event = "pull_request_target"'
+  stop_at_tick 1
+  run_wait
+  assert_status 99
+  assert_output_contains "runs/300 (weight 5)"
+}
+
+@test "run-id takes the turn on behalf of a pull_request_target run from a fork" {
+  on_behalf_of_fork_run
+  set_run 300 '.event = "pull_request_target"'
+  run_wait
+  assert_status 0
+  assert_output_contains "Waiting for the turn on behalf of run 300 of pull request #3."
+  [ "$(lock_message 1)" = "priority-boarding: run 300, pull request 3" ]
+}
+
+@test "a run from a fork fails when its pull request has a newer run of another commit" {
+  this_run_is_fork
+  set_pr 1 '.head.sha = "head1new"'
+  fork_run 300 1 00:15 head1new
+  run_wait
+  assert_status 1
+  assert_output_contains "::error::A newer commit of pull request #1 is tested in https://github.com/owner/repo/actions/runs/300."
+}
+
+@test "an older run from a fork is left out when its pull request has a newer run" {
+  set_run 100 '.run_started_at = "2026-01-01T00:20:00Z"'
+  add_pr 3
+  set_pr 3 '.head.sha = "head3new"'
+  fork_run 300 3 00:05 head3
+  fork_run 301 3 00:10 head3new
+  stop_at_tick 1
+  run_wait
+  assert_status 99
+  assert_output_contains "Position 2 of 2"
+  refute_output_contains "runs/300"
+}
+
+@test "a run from a fork isn't matched to a pull request of the same branch name in another repository" {
+  export INPUT_LABEL_WEIGHTS="prio=5"
+  add_pr 3 prio
+  fork_run 300 3 00:15
+  set_run 300 '.head_repository.full_name = "other/repo"'
+  set_run 100 '.run_started_at = "2026-01-01T00:20:00Z"'
+  stop_at_tick 1
+  run_wait
+  assert_status 99
+  assert_output_contains "runs/300 (weight 0)"
+}
+
+@test "a run from a fork branch with several open pull requests counts as without a pull request" {
+  export INPUT_LABEL_WEIGHTS="prio=5"
+  add_pr 3 prio
+  add_pr 4 prio
+  fork_run 300 3 00:15
+  set_pr 4 '.head = {sha: "head3", ref: "branch3", repo: {full_name: "someone/repo"}} | .base.ref = "release"'
+  set_run 100 '.run_started_at = "2026-01-01T00:20:00Z"'
+  stop_at_tick 1
+  run_wait
+  assert_status 99
+  assert_output_contains "runs/300 (weight 0)"
+}
+
+@test "read-only doesn't rebase with update-token" {
+  export INPUT_READ_ONLY=true INPUT_REQUIRE_UP_TO_DATE=true INPUT_UPDATE_PENDING=true UPDATE_TOKEN=update
+  set_behind head1 3
+  run_wait
+  assert_status 1
+  assert_output_contains "::error::Branch is 3 commit(s) behind main."
+  [ "$(count_calls '^PR ')" -eq 0 ]
+}
+
+@test "a run from a fork waits for another run to take the turn on its behalf" {
+  this_run_is_fork
+  at_tick 2 'hold_lock 1 100 1'
+  run_wait
+  assert_status 0
+  assert_output_contains "The token is read-only"
+  assert_output_contains "The turn is free, waiting for another run to take it on behalf of this run."
+  assert_output_contains "This run already has the turn."
+  [ "$(count_calls '^POST git/')" -eq 0 ]
+  [ "$(count_calls '^POST statuses/')" -eq 0 ]
+  [ "$(count_calls '^sleep 30$')" -eq 2 ]
+}
+
+@test "a run from a fork fails when no run takes the turn on its behalf" {
+  this_run_is_fork
+  run_wait
+  assert_status 1
+  assert_output_contains "::error::No run took the turn on behalf of this run within 5 minutes."
+  [ "$(count_calls '^POST git/')" -eq 0 ]
+}
+
+@test "a run from a fork waits as usual while the turn is held" {
+  this_run_is_fork
+  holder_running
+  at_tick 20 'complete_run 200 failure'
+  at_tick 21 'hold_lock 2 100 1'
+  run_wait
+  assert_status 0
+  assert_output_contains "Turn held by run 200."
+  refute_output_contains "::error::"
+}
+
+@test "read-only false takes the turn for a run from a fork" {
+  export INPUT_READ_ONLY=false
+  this_run_is_fork
+  run_wait
+  assert_status 0
+  assert_holds 1
+}
+
+@test "read-only true waits for another run to take the turn" {
+  export INPUT_READ_ONLY=true
+  at_tick 1 'hold_lock 1 100 1'
+  run_wait
+  assert_status 0
+  [ "$(count_calls '^POST git/')" -eq 0 ]
+}
+
+@test "rejects an invalid read-only" {
+  export INPUT_READ_ONLY=maybe
+  run_wait
+  assert_status 1
+  assert_output_contains "::error::Invalid read-only: maybe."
+}
+
+@test "run-id takes the turn on behalf of a run from a fork" {
+  on_behalf_of_fork_run
+  run_wait
+  assert_status 0
+  assert_output_contains "Waiting for the turn on behalf of run 300 of pull request #3."
+  assert_locks 1
+  [ "$(lock_message 1)" = "priority-boarding: run 300, pull request 3" ]
+  # The commit status of the fork run's commit, linked to the fork run.
+  [ "$(count_calls '^POST statuses/head3 .*actions/runs/300$')" -eq 2 ]
+  assert_last_commit_status "success|Took the turn."
+}
+
+@test "run-id ends when the run it waits for tests an outdated commit" {
+  on_behalf_of_fork_run
+  set_pr 3 '.head.sha = "head3new"'
+  run_wait
+  assert_status 0
+  assert_output_contains "Run 300 tests an outdated commit of pull request #3, nothing to do."
+  assert_locks ""
+  [ "$(count_calls '^POST ')" -eq 0 ]
+}
+
+@test "run-id waits in the place of the run it waits for" {
+  on_behalf_of_fork_run
+  set_run 300 '.run_started_at = "2026-01-01T00:15:00Z"'
+  stop_at_tick 1
+  run_wait
+  assert_status 99
+  assert_output_contains "Position 2 of 2 (weight 0)"
+  assert_locks ""
+}
+
+@test "run-id ends when the run it waits for already has the turn" {
+  on_behalf_of_fork_run
+  hold_lock 1 300 3
+  run_wait
+  assert_status 0
+  assert_output_contains "Run 300 already has the turn."
+  assert_locks 1
+  # Started again for a later job of run 300: the status stays as it is.
+  [ ! -s "$FAKE_STATE/statuses.log" ]
+}
+
+@test "run-id leaves the status alone when the run it waits for ended before it started" {
+  on_behalf_of_fork_run
+  holder_running
+  complete_run 300
+  run_wait
+  assert_status 0
+  assert_output_contains "Run 300 ended before it took the turn, nothing left to do."
+  [ ! -s "$FAKE_STATE/statuses.log" ]
+}
+
+@test "run-id ends when the run it waits for ends" {
+  on_behalf_of_fork_run
+  holder_running
+  at_tick 1 'complete_run 300 cancelled'
+  run_wait
+  assert_status 0
+  assert_output_contains "Run 300 ended before it took the turn, nothing left to do."
+  assert_last_commit_status "error|Run ended before it took the turn."
+  assert_locks 1
+}
+
+@test "run-id of a run without a pull request" {
+  export INPUT_RUN_ID=300 GITHUB_RUN_ID=900 GITHUB_EVENT_NAME=workflow_run
+  export PR_NUMBER="" BASE_REF="" HEAD_SHA="" HEAD_REPO=""
+  add_run 300 "" 00:05
+  run_wait
+  assert_status 0
+  [ "$(lock_message 1)" = "priority-boarding: run 300" ]
+}
+
+@test "run-id reads a run of a workflow file with spaces in its name" {
+  on_behalf_of_fork_run
+  export INPUT_WORKFLOW=test.yml
+  set_run 300 '.path = ".github/workflows/CI Checks.yml"'
+  run_wait
+  assert_status 0
+  assert_output_contains "Waiting for the turn on behalf of run 300 of pull request #3."
+  [ "$(count_calls '^POST statuses/head3 ')" -eq 2 ]
+}
+
+@test "run-id of a push run doesn't take the pull request of its branch" {
+  export INPUT_RUN_ID=300 GITHUB_RUN_ID=900 GITHUB_EVENT_NAME=workflow_run
+  export PR_NUMBER="" BASE_REF="" HEAD_SHA="" HEAD_REPO=""
+  add_run 300 "" 00:05
+  add_pr 3
+  set_pr 3 '.head.ref = "branch300" | .head.sha = "head300"'
+  run_wait
+  assert_status 0
+  [ "$(lock_message 1)" = "priority-boarding: run 300" ]
+}
+
+@test "run-id of a run that names its pull request" {
+  export INPUT_RUN_ID=300 GITHUB_RUN_ID=900 GITHUB_EVENT_NAME=workflow_run
+  export PR_NUMBER="" BASE_REF="" HEAD_SHA="" HEAD_REPO=""
+  add_pr 3
+  add_run 300 3 00:05
+  run_wait
+  assert_status 0
+  [ "$(lock_message 1)" = "priority-boarding: run 300, pull request 3" ]
+}
+
+@test "run-id of a fork branch with several open pull requests takes the turn without a pull request" {
+  on_behalf_of_fork_run
+  add_pr 4
+  set_pr 4 '.head = {sha: "head3", ref: "branch3", repo: {full_name: "someone/repo"}} | .base.ref = "release"'
+  run_wait
+  assert_status 0
+  assert_output_contains "Waiting for the turn on behalf of run 300."
+  [ "$(lock_message 1)" = "priority-boarding: run 300" ]
+}
+
+@test "rejects an invalid run-id" {
+  export INPUT_RUN_ID=abc
+  run_wait
+  assert_status 1
+  assert_output_contains "::error::Invalid run-id: abc."
+}
+
+@test "rejects read-only true with run-id" {
+  on_behalf_of_fork_run
+  export INPUT_READ_ONLY=true
+  run_wait
+  assert_status 1
+  assert_output_contains "::error::read-only and run-id can't be combined"
+}
+
+@test "run-id fails when the run can't be read" {
+  on_behalf_of_fork_run
+  fail_api 404 '^GET actions/runs/300$'
+  run_wait
+  assert_status 1
+  assert_output_contains "::error::Reading run 300 failed."
+}
+
+@test "run-id fails when the pull requests can't be listed" {
+  on_behalf_of_fork_run
+  fail_api 500 '^GET pulls$'
+  run_wait
+  assert_status 1
+  assert_output_contains "::error::Listing pull requests failed."
 }

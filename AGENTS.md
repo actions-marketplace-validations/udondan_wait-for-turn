@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A composite GitHub Action. `action.yml` maps inputs to `INPUT_*` env vars (plus PR context like `PR_NUMBER`, `BASE_REF`, `HEAD_SHA`, `HEAD_REPO`, `UPDATE_TOKEN`) and runs `wait.sh`. All logic is in `wait.sh` (bash + `gh api` + `jq`). There is no build step and no package manager. `.github/workflows/priority-boarding.yml` is a reusable workflow (`on: workflow_call`, never runs on its own) with the recommended wait job; it calls the action with `uses: $/`, the same commit, and `test.yml` calls it on every PR as a test. README.md documents user-facing behavior; keep it, `action.yml` input descriptions, the inputs of the reusable workflow and the header comment of `wait.sh` in sync when behavior changes.
+A composite GitHub Action. `action.yml` maps inputs to `INPUT_*` env vars (plus PR context like `PR_NUMBER`, `BASE_REF`, `HEAD_SHA`, `HEAD_REPO`, `UPDATE_TOKEN`) and runs `wait.sh`. All logic is in `wait.sh` (bash + `gh api` + `jq`). There is no build step and no package manager. `.github/workflows/priority-boarding.yml` is a reusable workflow (`on: workflow_call`, never runs on its own) with the recommended wait job; it calls the action with `uses: $/`, the same commit, and `test.yml` calls it on every PR as a test. README.md documents user-facing behavior; keep it, `action.yml` input descriptions, the inputs of the reusable workflow and the header comment of `wait.sh` in sync when behavior changes. The mermaid flow diagram under "How it works" in README.md shows the main loop of `wait.sh`: update it in the same change whenever a step, exit, wait condition or path through the loop changes (forks and `run-id` runs included), so it always matches the code. The same goes for the sequence diagram under "Pull requests from forks", which shows how a fork's run and the `workflow_run` run with `run-id` hand over the turn.
 
 ## Commands
 
@@ -25,6 +25,7 @@ Tool versions are pinned in `mise.toml` (bats, ruby, shellcheck, actionlint, ziz
 - **Yield** (`find_pending`/`yielding`): before taking a free turn, the first run defers to open auto-merge PRs with higher weight whose head sha has no run yet, up to `yield-to-pending-minutes`. A tested PR that is behind is not waited for, unless `update-pending-branches` (needs `update-token`, never forks): then `check_head` rebases it and defers to its new commit.
 - **Polling**: first in line (or turn free) sleeps `poll-interval-seconds`, others `queued-poll-interval-seconds`; PR labels are refreshed on the slow interval or when the turn is free.
 - **Up to date** (`check_up_to_date`/`update_branch`): with `require-up-to-date`, fails when behind; with `update-token` it first runs `gh pr update-branch --rebase` (never for forks) and still exits 1, since the new commit starts a new run.
+- **Forks** (`read_only`, `run_id`, `self`): `self` is the run that waits, `GITHUB_RUN_ID` or `run-id`. A read-only run (auto: `pull_request` from a fork) never writes, `update-token` and `update-pending-branches` are ignored. When first in line with a free turn it waits for a lock naming it, `wait_for_handoff` fails it after 5 minutes. A `run-id` run (started by `workflow_run`, see `priority-boarding-forks.yml`) resolves head sha, PR (named by the run, else by head branch for `pull_request` and `pull_request_target` runs) and workflow from that run, takes the turn for it and exits 0 when that run has ended or tests an outdated commit of its PR. `workflow_run` sends `in_progress` again per later job of the run, so a `run-id` run sets its first status (`waiting`) only once it has to wait: finding the turn taken or the run ended leaves the status alone. Runs list entries of forks have no `pull_requests`; `match_query` fills `.pr` from the open PRs by head repository and branch (`head`, stable across new commits) for `pull_request` and `pull_request_target` events; a branch with several open PRs matches none.
 - **Commit status** (`set_status`): optional, only sent when changed, truncated to 140 chars; failure to set it disables it with a warning. An EXIT trap sets failure (or error on INT/TERM) unless the run took the turn.
 
 ## Test harness
@@ -38,7 +39,7 @@ Tests run the real `wait.sh` against a file-backed fake GitHub API:
 
 ## Releases
 
-release-please (`release-type: simple`) builds CHANGELOG.md and tags from conventional commits on main; the workflow then moves the major tag (`v1`) that users reference. PRs are squash-merged and the PR title must be a conventional commit (checked by `pr-conventional-title.yml`), since it becomes the commit release-please reads.
+release-please (`release-type: simple`) builds CHANGELOG.md and tags from conventional commits on main; the workflow then moves the major tag (`v1`) that users reference. Every Monday `automerge-schedule.yml` rebases the open release PR and turns on auto-merge, so releases go out weekly without manual steps. PRs are squash-merged and the PR title must be a conventional commit (checked by `pr-conventional-title.yml`), since it becomes the commit release-please reads.
 
 ## End-to-end tests
 

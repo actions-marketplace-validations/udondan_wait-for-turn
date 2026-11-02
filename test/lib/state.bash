@@ -12,6 +12,7 @@
 #   commits/<sha>  message of a commit created through the API
 #   refs/<ref>     sha of a ref, without the refs/ prefix
 #   fail           "<http code> <regex>" lines, matching API calls fail
+#   fail_message   message of these failures, "Fake failure" if missing
 #   hook           script run before every API call with method and path
 #   ticks/<n>      script run during the nth sleep
 #   calls.log      API calls and sleeps
@@ -38,7 +39,8 @@ new_commit() {
 }
 
 # add_run <id> [pr] [started hh:mm] [status] [conclusion] [head sha]
-# The head sha defaults to the pull request's head sha.
+# The head sha defaults to the pull request's head sha. The event is
+# pull_request with a pull request, push without.
 add_run() {
   local id=$1 pr=${2:-} started=${3:-00:00} status=${4:-in_progress} conclusion=${5:-} head=${6:-}
   [ -n "$head" ] || head=head${pr:-$id}
@@ -46,9 +48,26 @@ add_run() {
     --arg status "$status" --arg conclusion "$conclusion" --arg head "$head" '
     . + [{id: $id, status: $status,
       conclusion: (if $conclusion == "" then null else $conclusion end),
+      event: (if $pr == "" then "push" else "pull_request" end),
+      path: ".github/workflows/test.yml", head_repository: {full_name: "owner/repo"},
+      head_branch: "branch\(if $pr == "" then $id else $pr end)",
       head_sha: $head, run_started_at: "2026-01-01T\($started):00Z",
       html_url: "https://github.com/owner/repo/actions/runs/\($id)",
       pull_requests: (if $pr == "" then [] else [{number: ($pr | tonumber)}] end)}]'
+}
+
+# set_run <id> <jq expression applied to the run>
+set_run() {
+  json_edit runs.json --argjson id "$1" "map(if .id == \$id then ($2) else . end)"
+}
+
+# fork_run <id> <pr> [started hh:mm] [head sha]: a pull_request run of pull
+# request <pr> from a fork, of its branch branch<pr>. The runs list doesn't name
+# its pull request.
+fork_run() {
+  add_run "$1" "" "${3:-00:00}" in_progress "" "${4:-head$2}"
+  set_run "$1" ".event = \"pull_request\" | .head_repository.full_name = \"someone/repo\" | .head_branch = \"branch$2\""
+  set_pr "$2" '.head.repo.full_name = "someone/repo"'
 }
 
 # complete_run <id> [conclusion]
@@ -64,7 +83,7 @@ add_pr() {
     . + [{number: $n, state: "open",
       labels: ($labels | split(",") | map(select(. != "") | {name: .})),
       auto_merge: (if $auto then {merge_method: "squash"} else null end),
-      head: {sha: "head\($n)", repo: {full_name: "owner/repo"}}, base: {ref: "main"},
+      head: {sha: "head\($n)", ref: "branch\($n)", repo: {full_name: "owner/repo"}}, base: {ref: "main"},
       mergeable_state: "clean"}]'
 }
 
@@ -91,6 +110,12 @@ set_behind() {
 # "PR update-branch" matches gh pr update-branch.
 fail_api() {
   echo "$1 $2" >>"$FAKE_STATE/fail"
+}
+
+# fail_message <message>: the message of the failures of fail_api, like
+# "Resource not accessible by integration".
+fail_message() {
+  echo "$1" >"$FAKE_STATE/fail_message"
 }
 
 lock_dir() {

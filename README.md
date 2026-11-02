@@ -21,16 +21,23 @@ Waiting runs are ordered by weight (highest first), then by start time. A re-run
 
 The run that is next in line checks every `poll-interval-seconds`, the other waiting runs every `queued-poll-interval-seconds`. This keeps the API requests low when many runs are waiting. While the turn is free, all waiting runs check every `poll-interval-seconds`, so the next run takes the turn quickly when the first one never does. Labels are read while waiting, so labelling a pull request moves its waiting run in the queue.
 
-Active runs are read from the unfiltered run list. The `status` filter of the GitHub API is backed by a search index that can be stale and miss active runs (see [softprops/turnstyle#165](https://github.com/softprops/turnstyle/issues/165)).
+Active runs are read from the unfiltered run list. The `status` filter of the GitHub API is backed by a search index that can be stale and miss active runs.
 
-Each waiting run repeats these steps until it has the turn:
+Each waiting run, and each `workflow_run` run with `run-id` that waits in the place of a fork's run (see [forks](#pull-requests-from-forks)), repeats these steps until the turn is taken:
 
 ```mermaid
 flowchart TD
-    start([Run starts]) --> poll[List active runs and lock refs]
-    poll --> own{Newest lock ref created by this run?}
-    own -- "yes (re-run)" --> done([Has the turn, next jobs run])
-    own -- no --> newer{"PR has a newer run of another commit?"}
+    start([Run starts]) --> runid{"run-id given? (workflow_run for a fork)"}
+    runid -- no --> poll
+    runid -- yes --> target[Read that run and its pull request]
+    target --> targetold{"Run tests an outdated commit of its PR?"}
+    targetold -- yes --> nothing([End: nothing to do])
+    targetold -- no --> poll
+    poll[List active runs and lock refs] --> own{Newest lock ref names this run?}
+    own -- "yes (re-run, or taken on its behalf)" --> done([Has the turn, next jobs run])
+    own -- no --> ended{"With run-id: has that run ended?"}
+    ended -- yes --> nothing
+    ended -- no --> newer{"PR has a newer run of another commit?"}
     newer -- yes --> stale([Fail: commit is outdated])
     newer -- no --> active{Holder run still active?}
     active -- yes --> held[Turn held]
@@ -42,9 +49,16 @@ flowchart TD
     uptodate -- no --> outdated(["Fail: branch is behind (rebased first with update-token)"])
     uptodate -- yes --> queue["Order waiting runs by label weight, then start time, leaving out runs of PRs with a newer run"]
     queue --> first{Turn free and this run first?}
-    first -- yes --> take[Create lock ref n+1]
+    first -- yes --> yield{"Auto-merge PR with a higher weight about to be tested? (up to yield-to-pending-minutes)"}
+    yield -- no --> readonly{"Read-only? (pull_request from a fork)"}
+    readonly -- no --> take[Create lock ref n+1]
     take -- created --> done
     take -- "already exists" --> poll
+    take -- "no contents: write" --> noperm(["Fail: token can't write"])
+    readonly -- yes --> handoff{"Turn free for 5 minutes without a run taking it on its behalf?"}
+    handoff -- yes --> nohandoff([Fail: no workflow_run run took the turn])
+    handoff -- no --> timeout
+    yield -- yes --> timeout
     first -- no --> timeout{timeout-minutes reached?}
     timeout -- yes --> timedout([Fail: timed out])
     timeout -- no --> sleep["Sleep poll-interval-seconds if first in line or the turn is free, else queued-poll-interval-seconds"]
@@ -63,7 +77,7 @@ jobs:
       contents: write
       pull-requests: read
     concurrency:
-      group: ${{ github.workflow }}-wait-${{ github.head_ref || github.ref }}
+      group: ${{ github.workflow }}-wait-${{ github.event.pull_request.number || github.ref }}
       cancel-in-progress: true
     steps:
       - uses: udondan/priority-boarding@v1
@@ -139,11 +153,13 @@ Pass `label-weights: ''` or `status-context: ''` under `with:` to turn them off.
 | `update-pending-branches`      | `false`                     | Rebase pending auto-merge PRs with a higher weight that are behind (below). |
 | `update-token`                 |                             | Token to rebase a PR branch that is behind (see below).                     |
 | `status-context`               |                             | Context of a commit status showing the place in the queue (see below).      |
+| `read-only`                    | `auto`                      | Wait for another run to take the turn for this run, `auto` for forks.       |
+| `run-id`                       |                             | Run to take the turn for, see [forks](#pull-requests-from-forks).           |
 | `token`                        | `github.token`              | Token with `actions: read`, `contents: write` and `pull-requests: read`.    |
 
 ## Workflow setup
 
-**Cancel outdated waiting runs.** A new commit on a branch makes the waiting run of the previous commit outdated. The action fails it at its next check, but until then it takes a runner. A `concurrency` group per branch with `cancel-in-progress` cancels it right away. Put the group on the wait job only, not on the workflow or the jobs after it: once a run has the turn, the wait job is done, so jobs that already use the shared resources are never cancelled and can always clean up.
+**Cancel outdated waiting runs.** A new commit on a branch makes the waiting run of the previous commit outdated. The action fails it at its next check, but until then it takes a runner. A `concurrency` group per pull request with `cancel-in-progress` cancels it right away. Group by pull request number rather than branch name (`github.head_ref`): branches of forks can have the same name. Put the group on the wait job only, not on the workflow or the jobs after it: once a run has the turn, the wait job is done, so jobs that already use the shared resources are never cancelled and can always clean up.
 
 **Fail the jobs after the wait when the wait fails.** When the wait fails, for example as outdated or on timeout, jobs that need it are skipped, and a skipped job counts as passed for required checks. Run them with `if: ${{ !cancelled() }}` and fail them in a first step when the wait didn't succeed, as in the example above. Or require a single job that checks all others:
 
@@ -247,16 +263,80 @@ The token needs `statuses: write`. Without it, the action logs a warning and wai
 
 This action is for repositories without merge queue, for example ones owned by a user, where runs share resources and some pull requests should go first. It adds the order by labels and the handling of outdated branches and auto-merge.
 
-## Limitations
+## Pull requests from forks
 
-Pull requests from forks and from Dependabot get a read-only token and can't create the lock ref. The action then fails with a permission error. Skip the wait job for them instead:
+Runs of pull requests from forks get a read-only token and can't create the lock ref. They still wait in the queue like any other run, ordered by the labels of their pull request. But when such a run is first in line and the turn is free, another run has to take the turn on its behalf. The turn belongs to the run named in the lock, not to the run that created it.
+
+That other run is started by `workflow_run`, which runs the workflow of the default branch with a writable token, also for runs of forks. Add this workflow next to the one that waits, with the `name` of that workflow under `workflows`:
 
 ```yaml
+name: Priority boarding for forks
+
+on:
+  workflow_run: # zizmor: ignore[dangerous-triggers] no code of the pull request is run
+    workflows: [Test]
+    types: [in_progress]
+
+permissions: {}
+
+jobs:
   priority-boarding:
-    if: github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]')
+    if: github.event.workflow_run.event == 'pull_request' && github.event.workflow_run.head_repository.full_name != github.repository
+    permissions:
+      actions: read
+      contents: write
+      pull-requests: read
+      statuses: write
+    uses: udondan/priority-boarding/.github/workflows/priority-boarding.yml@v1
+    with:
+      run-id: ${{ format('{0}', github.event.workflow_run.id) }}
 ```
 
-Jobs after it then have to treat a skipped wait as success, for example with `if: needs.priority-boarding.result == 'failure' || needs.priority-boarding.result == 'cancelled'` in the `Check turn` step. They don't get the secrets either, so skip the jobs that use the shared resources for them as well.
+It starts when the run of the fork starts, waits in that run's place in the queue, takes the turn for it and ends. It also ends when the run of the fork ends first, for example when it is cancelled, or when it tests an outdated commit of its pull request. GitHub sends `in_progress` again when later jobs of that run start: those runs find the turn already taken, or the run ended, and end without changing the commit status. It never checks out the code of the pull request, so the writable token is not exposed to it. Pass it the same inputs as the waiting job, like `label-weights` and `require-up-to-date`, so both see the same queue. The commit status of the fork's run is set by this run, since the fork's run can't set it.
+
+```mermaid
+sequenceDiagram
+    participant F as Run of the fork (read-only token)
+    participant G as GitHub
+    participant C as workflow_run run (run-id)
+    participant L as Lock refs
+    F->>G: Run starts
+    G->>C: workflow_run, in_progress
+    C->>G: Read the fork's run and its pull request
+    par Both wait in the place of the fork's run
+        F->>L: Check lock refs and queue
+    and
+        C->>L: Check lock refs and queue
+        C->>G: Commit status: position in the queue
+    end
+    Note over F,L: First in line, the turn is free
+    C->>L: Create lock ref n+1 naming the fork's run
+    C->>G: Commit status: took the turn
+    Note over C: Ends
+    F->>L: Newest lock ref names this run
+    Note over F: Has the turn, next jobs run
+    G->>C: in_progress again when a later job starts
+    C->>L: Turn already taken
+    Note over C: Ends, commit status unchanged
+```
+
+The run of the fork detects that it is from a fork (`read-only: auto`). It fails when no run took the turn on its behalf within 5 minutes after it was first in line and the turn was free, so a missing `workflow_run` workflow doesn't hold up the queue for long. `in_progress` is also sent for re-runs and when the run of a first-time contributor was approved, unlike `requested`. Branches of forks are never rebased, see [Outdated branches](#outdated-branches).
+
+The list of runs doesn't name the pull request of a fork's run, so it is found by the fork and branch. When one branch of a fork has open pull requests to several base branches, its runs count as runs without a pull request, since they don't say which one they test.
+
+Runs of forks get no secrets on `pull_request`. Only jobs that use the shared resources without secrets can run for them, like a test environment that needs no credentials. Skip the other jobs for forks. A read-only token doesn't make a runner safe for the code of a fork: on a self-hosted runner that is reused, that code can stay on the machine and read the credentials of later jobs, or reach internal services. Run forks only on GitHub-hosted runners or on isolated self-hosted runners that are used for one job and then discarded.
+
+## pull_request_target
+
+A workflow on `pull_request_target` can wait like one on `pull_request`. Its runs name the pull request and its head commit, so they are ordered by its labels, and the turn is released by merging it as usual. Their token is writable, also for pull requests from forks, so these runs take the turn themselves and need no `workflow_run` workflow. Branches of forks are still never rebased.
+
+They run the workflow of the base branch with its secrets and a writable token. The action never checks out the code of the pull request, but the jobs after it must not run that code either, or it gets the secrets and the token. For forks, prefer `pull_request` with the `workflow_run` workflow above.
+
+## Pull requests from Dependabot
+
+Runs of Dependabot pull requests need nothing extra. Their token is read-only by default, but the `permissions` of the wait job raise it, as for any other run. Without `contents: write` the action fails right away instead of blocking the queue.
+
+They only get [Dependabot secrets](https://docs.github.com/en/code-security/dependabot/troubleshooting-dependabot/troubleshooting-dependabot-on-github-actions#accessing-secrets), not the secrets of Actions. Store `update-token` and the secrets of the jobs after the wait there as well, or they are empty for these runs. Without `update-token`, a Dependabot pull request that is behind fails with `require-up-to-date` instead of being rebased.
 
 ## Testing
 

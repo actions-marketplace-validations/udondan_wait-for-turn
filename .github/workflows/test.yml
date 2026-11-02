@@ -21,7 +21,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+      - uses: jdx/mise-action@6be3c7ed4c21d4f76b208d351d95aac273ebb76d # v5.2.4
         with:
           install_args: shellcheck
 
@@ -38,7 +38,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+      - uses: jdx/mise-action@6be3c7ed4c21d4f76b208d351d95aac273ebb76d # v5.2.4
         with:
           install_args: bats ruby
 
@@ -65,7 +65,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+      - uses: jdx/mise-action@6be3c7ed4c21d4f76b208d351d95aac273ebb76d # v5.2.4
         with:
           install_args: actionlint shellcheck zizmor
 
@@ -82,9 +82,9 @@ jobs:
 
   # Calls the reusable workflow of this commit as other repositories do, so a
   # broken change of it or of the action fails here before it is released.
-  # Pull requests from forks get no write permissions and can't take the turn.
+  # Runs of pull requests from forks get a read-only token and wait for
+  # priority-boarding-forks.yml to take the turn on their behalf.
   priority-boarding:
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     permissions:
       actions: read
       contents: write # lock refs under refs/priority-boarding/
